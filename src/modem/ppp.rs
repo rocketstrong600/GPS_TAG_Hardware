@@ -3,8 +3,13 @@ use atat::heapless::String;
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
 use embassy_net::dns::DnsQueryType;
-use embassy_net::{Config as NetConfig, ConfigV4, Ipv4Address, Ipv4Cidr, Runner as NetRunner, Stack, StackResources, StaticConfigV4};
-use embassy_net_ppp::{Config as PppConfig, Device as PppDevice, Runner as PppRunner, State as PppState};
+use embassy_net::{
+    Config as NetConfig, ConfigV4, Ipv4Address, Ipv4Cidr, Runner as NetRunner, Stack,
+    StackResources, StaticConfigV4,
+};
+use embassy_net_ppp::{
+    Config as PppConfig, Device as PppDevice, Runner as PppRunner, State as PppState,
+};
 use embassy_time::{Duration, Instant, Timer, WithTimeout};
 use static_cell::StaticCell;
 
@@ -14,8 +19,10 @@ use super::commands::{GetEpsRegStatus, SetPdpContext};
 #[derive(Debug, Clone, defmt::Format)]
 pub enum PppError {
     At(atat::Error),
+    InvalidApn,
     RegistrationDenied,
     RegistrationTimeout,
+    ConfigTimeout,
 }
 
 impl From<atat::Error> for PppError {
@@ -26,10 +33,13 @@ impl From<atat::Error> for PppError {
 
 /// Configures PDP context 1 (`AT+CGDCONT=1,"IP","<apn>"`) on `DLCI 1`.
 pub async fn configure_apn<C: AtatClient>(client: &mut C, apn: &str) -> Result<(), PppError> {
+    if apn.is_empty() || apn.len() > 32 {
+        return Err(PppError::InvalidApn);
+    }
     let mut pdp_type = String::<8>::new();
     let _ = pdp_type.push_str("IP");
     let mut apn_str = String::<32>::new();
-    let _ = apn_str.push_str(apn);
+    apn_str.push_str(apn).map_err(|_| PppError::InvalidApn)?;
 
     client
         .send(&SetPdpContext {
@@ -42,7 +52,7 @@ pub async fn configure_apn<C: AtatClient>(client: &mut C, apn: &str) -> Result<(
     Ok(())
 }
 
-/// Polls `AT+CEREG?` on `DLCI 1` until registered on LTE (`stat = 1` or `5`).
+/// Polls `AT+CEREG?` on `DLCI 1` until registered on LTE (`stat = 1` home or `5` roaming).
 pub async fn wait_for_lte_registration<C: AtatClient>(
     client: &mut C,
     timeout: Duration,
@@ -74,8 +84,10 @@ pub async fn wait_for_lte_registration<C: AtatClient>(
 
 /// Starts `embassy-net-ppp` and the `embassy-net` stack over CMUX `DLCI 2`.
 pub fn start(spawner: &Spawner, ppp_ch: CmuxChannel, random_seed: u64) -> Stack<'static> {
+    super::cmux::set_ppp_framing(true);
+
     static PPP_STATE: StaticCell<PppState<4, 4>> = StaticCell::new();
-    static NET_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+    static NET_RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
 
     let (device, ppp_runner) = embassy_net_ppp::new(PPP_STATE.init(PppState::new()));
     let (stack, net_runner) = embassy_net::new(
@@ -122,6 +134,8 @@ async fn ppp_runner_task(
         })
         .await;
 
+    super::cmux::set_ppp_framing(false);
+    stack.set_config_v4(ConfigV4::None);
     error!("PPP runner exited: {:?}", err);
 }
 
@@ -130,21 +144,27 @@ async fn net_runner_task(mut runner: NetRunner<'static, PppDevice<'static>>) {
     runner.run().await;
 }
 
+/// Waits up to `timeout` for PPP IPv4 configuration to come up and returns the assigned IPv4 address.
+pub async fn wait_up(stack: Stack<'static>, timeout: Duration) -> Result<Ipv4Address, PppError> {
+    if stack.wait_config_up().with_timeout(timeout).await.is_err() {
+        return Err(PppError::ConfigTimeout);
+    }
+    stack
+        .config_v4()
+        .map(|cfg| cfg.address.address())
+        .ok_or(PppError::ConfigTimeout)
+}
+
 /// Waits for IPv4 config and runs a DNS lookup to verify end-to-end LTE data over `DLCI 2`.
+#[allow(dead_code)]
 pub async fn test_connectivity(stack: Stack<'static>) {
     info!("Waiting for PPP IPv4 config...");
-    if stack
-        .wait_config_up()
-        .with_timeout(Duration::from_secs(20))
-        .await
-        .is_err()
-    {
-        error!("PPP IPv4 config timed out");
-        return;
-    }
-
-    if let Some(cfg) = stack.config_v4() {
-        info!("PPP IP ready: {}", cfg.address);
+    match wait_up(stack, Duration::from_secs(20)).await {
+        Ok(ip) => info!("PPP IP ready: {}", ip),
+        Err(_) => {
+            error!("PPP IPv4 config timed out");
+            return;
+        }
     }
 
     match stack.dns_query("example.com", DnsQueryType::A).await {

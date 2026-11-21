@@ -65,7 +65,26 @@
 
 ---
 
-## 4. Board Peripherals (UI / Audio)
+## 4. BLE Module — Murata `MBN52832` (`nRF52832`)
+
+### STM32 ↔ MBN52832 UART (`USART2`)
+
+| STM32 Pin | Peripheral / Signal | MBN52832 Pin | Notes |
+| --- | --- | --- | --- |
+| `PA0` | `USART2_CTS` | `P0.09` | Requires `nfc-pins-as-gpio` on nRF52832 |
+| `PA1` | `USART2_RTS` | `P0.10` | Requires `nfc-pins-as-gpio` on nRF52832 |
+| `PA2` | `USART2_TX` | `P0.14` | STM32 TX → nRF RX |
+| `PA3` | `USART2_RX` | `P0.15` | STM32 RX ← nRF TX |
+| `PC2` | `Output` (`ble_reset`) | `nRESET` (`P0.21`) | Active-high via open-drain transistor (`HIGH` resets nRF, `LOW` = run) |
+
+### MBN52832 SWD Test Pads (5-Pad Row)
+
+- **SWD IDs:** `DPIDR = 0x2BA01477`, `CTRL-AP IDR = 0x02880000` (factory `APPROTECT` unlocked via CMSIS-DAP / RP2040 `debugprobe`).
+- **Pad Map:** `Pad 1 = SWDIO`, `Pad 2 = SWCLK`, `Pad 3 = nRESET` (open-drain transistor), `Pad 4 = 3.3V VDD`, `Pad 5 = GND`.
+
+---
+
+## 5. Board Peripherals (UI / Audio)
 
 | STM32 Pin | Peripheral / Signal | Notes |
 | --- | --- | --- |
@@ -74,19 +93,27 @@
 
 ---
 
-## 5. Unidentified / Observed Signals
+## 6. Unidentified / Observed Signals
 
 | STM32 Pin | Firmware / Probe Observation | Notes |
 | --- | --- | --- |
 | `PB14` | `_uknwn_vreg` | Suspected voltage regulator / lights enable |
 | `PB13` | `_stm_out_2` | Output pin (unidentified function) |
-| `PA12` | Input probe `0b1111` | Continuously reads `HIGH` against internal `Pull::Down` (external pull-up or driven high) |
+| `PA12` | Input probe `0b1111` | External pull-up / driven high (occasionally pulses low ~13 ms) |
 | `PC0` | Input probe `0b1111` | Continuously reads `HIGH` against internal `Pull::Down` (external pull-up or driven high) |
 
 ---
 
-## 6. Unconnected / Floating Candidates (Tested)
+## 7. Free Pins for ST25DV16K (Soft_I2C)
+| STM32 Pin | Peripheral / Signal | Notes |
+| --- | --- | --- |
+| `PC10` | `I2CS_SCL` |
+| `PC11` | `I2CS_SDA` |
+
+---
+
+## 8. Unconnected / Floating Candidates (Tested)
 
 During the `I2C` and `BMI160` GPIO probes:
 - **No I2C devices found** on `I2C1 (PB6/PB7)`, `I2C2 (PB10/PB3)`, or `I2C3 (PA8/PC9)`.
-- **Read `LOW` (with internal `Pull::Down`):** `PA0..PA6`, `PA8..PA11`, `PA15`, `PB2`, `PB3`, `PB10`, `PC1..PC3`, `PC5`, `PC9..PC13`, `PD2`.
+- **Read `LOW` (with internal `Pull::Down`):** `PA4..PA6`, `PA8..PA11`, `PA15`, `PB2`, `PB3`, `PB10`, `PC1`, `PC3`, `PC5`, `PC9..PC13`, `PD2`.

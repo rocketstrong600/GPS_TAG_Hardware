@@ -1,6 +1,6 @@
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::{Level, Output, OutputType, Pull, Speed};
-use embassy_stm32::mode::Async;
+use embassy_stm32::mode::{Async, Blocking};
 use embassy_stm32::rcc::*;
 use embassy_stm32::time::{Hertz, hz};
 use embassy_stm32::timer::Channel;
@@ -29,6 +29,11 @@ pub struct ImuPins {
     pub int2: ExtiInput<'static, Async>,
 }
 
+pub struct BlePins {
+    pub uart: Uart<'static, Blocking>,
+    pub reset: Output<'static>,
+}
+
 pub struct Board {
     pub led: Output<'static>,
     pub buzzer: Buzzer<'static, peripherals::TIM3>,
@@ -36,6 +41,8 @@ pub struct Board {
     pub modem_tx: UartTx<'static, Async>,
     pub modem_rx: RingBufferedUartRx<'static>,
     pub imu: ImuPins,
+    pub ble: BlePins,
+    pub flash: Peri<'static, peripherals::FLASH>,
     #[allow(dead_code)]
     pub vreg_en: Output<'static>,
     #[allow(dead_code)]
@@ -97,8 +104,10 @@ pub fn init() -> Board {
     )
     .unwrap();
     let (modem_tx, m_rx) = m_uart.split();
-    static RING_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-    let modem_rx = m_rx.into_ring_buffered(RING_BUF.init([0; 256]));
+    static RING_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+    let modem_rx = m_rx.into_ring_buffered(RING_BUF.init([0; 1024]));
+
+    let ble_uart = Uart::new_blocking(p.USART2, p.PA3, p.PA2, usart::Config::default()).unwrap();
 
     Board {
         led,
@@ -113,6 +122,11 @@ pub fn init() -> Board {
             int1: ExtiInput::new(p.PB7, p.EXTI7, Pull::Down, Irqs),
             int2: ExtiInput::new(p.PB6, p.EXTI6, Pull::Down, Irqs),
         },
+        ble: BlePins {
+            uart: ble_uart,
+            reset: Output::new(p.PC2, Level::Low, Speed::Low),
+        },
+        flash: p.FLASH,
         vreg_en: Output::new(p.PB14, Level::Low, Speed::Low),
         stm_out_2: Output::new(p.PB13, Level::Low, Speed::Low),
     }

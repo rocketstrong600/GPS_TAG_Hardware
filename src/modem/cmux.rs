@@ -1,3 +1,4 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use defmt::{debug, error, warn};
 use embassy_executor::Spawner;
 use embassy_stm32::mode::Async;
@@ -23,13 +24,20 @@ pub const DLCI_CTRL: u8 = 0;
 pub const DLCI_AT: u8 = 1;
 pub const DLCI_PPP: u8 = 2;
 
-const PIPE_BUF_SIZE: usize = 1024;
+const PIPE_BUF_SIZE: usize = 4096;
 const MAX_FRAME_INFO: usize = 512;
 
 static UART_TX: Mutex<CriticalSectionRawMutex, Option<UartTx<'static, Async>>> = Mutex::new(None);
 static DLCI1_PIPE: Pipe<CriticalSectionRawMutex, PIPE_BUF_SIZE> = Pipe::new();
 static DLCI2_PIPE: Pipe<CriticalSectionRawMutex, PIPE_BUF_SIZE> = Pipe::new();
 static CTRL_ACK: Signal<CriticalSectionRawMutex, (u8, u8)> = Signal::new();
+static PPP_FRAMING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables PPP frame de-interleaving and FCS-16 validation on `DLCI 2`.
+/// Must be `false` while dialing (`ATD*99#`) and `true` once PPP data mode begins.
+pub fn set_ppp_framing(active: bool) {
+    PPP_FRAMING_ACTIVE.store(active, Ordering::Relaxed);
+}
 
 #[rustfmt::skip]
 const FCS_TABLE: [u8; 256] = [
@@ -99,7 +107,7 @@ async fn send_raw_frame(dlci: u8, ctrl: u8, info: &[u8]) -> Result<(), CmuxError
 
     let mut guard = UART_TX.lock().await;
     let tx = guard.as_mut().ok_or(CmuxError)?;
-    tx.write(&frame[..total]).await.map_err(|_| CmuxError)?;
+    tx.write_all(&frame[..total]).await.map_err(|_| CmuxError)?;
     Ok(())
 }
 
@@ -149,6 +157,18 @@ async fn open_dlci(dlci: u8) -> Result<(), CmuxError> {
 #[allow(dead_code)]
 pub async fn close_dlci(dlci: u8) -> Result<(), CmuxError> {
     send_raw_frame(dlci, CTRL_DISC, &[]).await
+}
+
+/// Writes raw bytes to `DLCI 1` (AT channel), chunking to `MAX_INFO_LEN`.
+/// Useful for two-phase AT prompts like `AT+CMGS="..."\r` before sending the body via `atat`.
+#[allow(dead_code)]
+pub async fn write_at_raw(mut data: &[u8]) -> Result<(), CmuxError> {
+    while !data.is_empty() {
+        let n = data.len().min(MAX_INFO_LEN);
+        send_raw_frame(DLCI_AT, CTRL_UIH, &data[..n]).await?;
+        data = &data[n..];
+    }
+    Ok(())
 }
 
 /// Virtual serial channel over a TS 27.010 DLCI.
@@ -281,36 +301,62 @@ impl Write for CmuxChannel {
 #[embassy_executor::task]
 async fn cmux_rx_task(mut rx: RingBufferedUartRx<'static>) {
     let mut byte = [0u8; 1];
+    // TS 27.010 Basic Option permits consecutive frames to share a single 0xF9 flag.
+    let mut have_opening_flag = false;
+    let mut ppp_deframer = PppDeframer::new();
 
     loop {
-        // 1. Hunt for opening 0xF9 flag
-        loop {
-            if rx.read(&mut byte).await.is_err() {
-                continue;
-            }
-            if byte[0] == FLAG {
-                break;
+        // 1. Hunt for opening 0xF9 flag (unless previous frame's closing flag serves as opening flag)
+        if !have_opening_flag {
+            let mut rdy_win = [0u8; 3];
+            loop {
+                match rx.read(&mut byte).await {
+                    Ok(1) => {
+                        if byte[0] == FLAG {
+                            break;
+                        }
+                        rdy_win.copy_within(1.., 0);
+                        rdy_win[2] = byte[0];
+                        if &rdy_win == b"RDY" {
+                            error!("CMUX lost sync: modem emitted raw RDY (unexpected reboot)");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("CMUX UART RX err (hunt): {:?}", e),
+                }
             }
         }
+        have_opening_flag = false;
 
         // 2. Skip consecutive 0xF9 flags; first non-flag byte is Address
         let addr = loop {
-            if rx.read(&mut byte).await.is_err() {
-                continue;
-            }
-            if byte[0] != FLAG {
-                break byte[0];
+            match rx.read(&mut byte).await {
+                Ok(1) => {
+                    if byte[0] != FLAG {
+                        break byte[0];
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("CMUX UART RX err (addr): {:?}", e);
+                    break FLAG;
+                }
             }
         };
+        if addr == FLAG {
+            continue;
+        }
 
         // 3. Control byte
-        if rx.read(&mut byte).await.is_err() {
+        if let Err(e) = rx.read(&mut byte).await {
+            warn!("CMUX UART RX err (ctrl): {:?}", e);
             continue;
         }
         let ctrl = byte[0];
 
         // 4. Length byte(s)
-        if rx.read(&mut byte).await.is_err() {
+        if let Err(e) = rx.read(&mut byte).await {
+            warn!("CMUX UART RX err (len1): {:?}", e);
             continue;
         }
         let len1 = byte[0];
@@ -318,7 +364,8 @@ async fn cmux_rx_task(mut rx: RingBufferedUartRx<'static>) {
         let (header_len, info_len) = if (len1 & 0x01) != 0 {
             (3usize, (len1 >> 1) as usize)
         } else {
-            if rx.read(&mut byte).await.is_err() {
+            if let Err(e) = rx.read(&mut byte).await {
+                warn!("CMUX UART RX err (len2): {:?}", e);
                 continue;
             }
             let len2 = byte[0];
@@ -337,7 +384,12 @@ async fn cmux_rx_task(mut rx: RingBufferedUartRx<'static>) {
         let mut got = 0usize;
         while got < info_len {
             match rx.read(&mut info[got..info_len]).await {
-                Ok(0) | Err(_) => {
+                Ok(0) => {
+                    read_ok = false;
+                    break;
+                }
+                Err(e) => {
+                    warn!("CMUX UART RX err (info): {:?}", e);
                     read_ok = false;
                     break;
                 }
@@ -349,12 +401,29 @@ async fn cmux_rx_task(mut rx: RingBufferedUartRx<'static>) {
         }
 
         // 6. FCS + closing 0xF9 flag
-        if rx.read(&mut byte).await.is_err() {
+        if let Err(e) = rx.read(&mut byte).await {
+            warn!("CMUX UART RX err (fcs): {:?}", e);
             continue;
         }
         let rx_fcs = byte[0];
-        if rx.read(&mut byte).await.is_err() || byte[0] != FLAG {
-            continue;
+        match rx.read(&mut byte).await {
+            Ok(1) if byte[0] == FLAG => {
+                have_opening_flag = true;
+            }
+            Ok(_) => {
+                warn!(
+                    "CMUX bad closing flag: 0x{:02X} (dlci={}, ctrl=0x{:02X}, len={})",
+                    byte[0],
+                    addr >> 2,
+                    ctrl,
+                    info_len
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!("CMUX UART RX err (close): {:?}", e);
+                continue;
+            }
         }
 
         let expected_fcs = calc_fcs(&header[..header_len]);
@@ -363,6 +432,7 @@ async fn cmux_rx_task(mut rx: RingBufferedUartRx<'static>) {
                 "CMUX FCS mismatch: got 0x{:02X}, expected 0x{:02X}",
                 rx_fcs, expected_fcs
             );
+            have_opening_flag = false;
             continue;
         }
 
@@ -377,11 +447,14 @@ async fn cmux_rx_task(mut rx: RingBufferedUartRx<'static>) {
                 let payload = &info[..info_len];
                 match dlci {
                     DLCI_CTRL => handle_ctrl_uih(payload).await,
-                    DLCI_AT => {
-                        let _ = DLCI1_PIPE.write(payload).await;
-                    }
+                    DLCI_AT => write_pipe_all(&DLCI1_PIPE, payload, DLCI_AT).await,
                     DLCI_PPP => {
-                        let _ = DLCI2_PIPE.write(payload).await;
+                        if PPP_FRAMING_ACTIVE.load(Ordering::Relaxed) {
+                            ppp_deframer.push_chunk(payload, &DLCI2_PIPE).await;
+                        } else {
+                            ppp_deframer.reset();
+                            write_pipe_all(&DLCI2_PIPE, payload, DLCI_PPP).await;
+                        }
                     }
                     _ => {
                         debug!("CMUX UIH for unknown DLCI {}", dlci);
@@ -395,13 +468,171 @@ async fn cmux_rx_task(mut rx: RingBufferedUartRx<'static>) {
     }
 }
 
+async fn write_pipe_all(
+    pipe: &'static Pipe<CriticalSectionRawMutex, PIPE_BUF_SIZE>,
+    mut data: &[u8],
+    dlci: u8,
+) {
+    let write_all = async {
+        while !data.is_empty() {
+            let n = pipe.write(data).await;
+            data = &data[n..];
+        }
+    };
+    if write_all
+        .with_timeout(Duration::from_millis(50))
+        .await
+        .is_err()
+    {
+        warn!("CMUX DLCI {} pipe full, dropped {} bytes", dlci, data.len());
+    }
+}
+
 async fn handle_ctrl_uih(payload: &[u8]) {
-    // Reply to MSC (Modem Status Command, type 0xE3) with MSC response (0xE1)
-    if payload.len() >= 2 && payload[0] == 0xE3 {
-        let mut resp = [0u8; 8];
+    // Reply to MSC (0xE3 -> 0xE1) and Test (0x23 -> 0x21) control frames.
+    if payload.len() >= 2 && (payload[0] == 0xE3 || payload[0] == 0x23) {
+        let mut resp = [0u8; 32];
         let n = payload.len().min(resp.len());
         resp[..n].copy_from_slice(&payload[..n]);
-        resp[0] = 0xE1;
+        resp[0] = payload[0] & !0x02; // Clear C/R bit (command -> response)
         let _ = send_raw_frame(DLCI_CTRL, CTRL_UIH, &resp[..n]).await;
     }
+}
+
+const PPP_FLAG: u8 = 0x7E;
+const PPP_ESC: u8 = 0x7D;
+
+/// Reassembles PPP frames on `DLCI 2`, de-interleaving complete small PPP packets that the
+/// Quectel EC21-AU CMUX layer occasionally inserts between 127-byte chunks of a larger PPP
+/// frame, and validating PPP FCS-16 so malformed frames never poison `ppproto::FrameReader`.
+struct PppDeframer {
+    long_buf: [u8; 2048],
+    long_len: usize,
+    deferred_buf: [u8; 512],
+    deferred_len: usize,
+}
+
+impl PppDeframer {
+    const fn new() -> Self {
+        Self {
+            long_buf: [0u8; 2048],
+            long_len: 0,
+            deferred_buf: [0u8; 512],
+            deferred_len: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.long_len = 0;
+        self.deferred_len = 0;
+    }
+
+    async fn push_chunk(
+        &mut self,
+        payload: &[u8],
+        pipe: &'static Pipe<CriticalSectionRawMutex, PIPE_BUF_SIZE>,
+    ) {
+        // Detect a complete, self-contained PPP frame interleaved mid-packet by EC21 CMUX.
+        if self.long_len > 1
+            && payload.len() >= 6
+            && payload[0] == PPP_FLAG
+            && payload[payload.len() - 1] == PPP_FLAG
+            && is_valid_ppp_frame(payload)
+        {
+            if self.deferred_len + payload.len() <= self.deferred_buf.len() {
+                self.deferred_buf[self.deferred_len..self.deferred_len + payload.len()]
+                    .copy_from_slice(payload);
+                self.deferred_len += payload.len();
+            } else {
+                warn!(
+                    "PPP deferred buffer full, dropped {}B interleaved frame",
+                    payload.len()
+                );
+            }
+            return;
+        }
+
+        for &b in payload {
+            if b == PPP_FLAG {
+                if self.long_len == 0 {
+                    self.long_buf[0] = PPP_FLAG;
+                    self.long_len = 1;
+                } else if self.long_len == 1 {
+                    // Consecutive 0x7E flags; keep single opening flag.
+                } else {
+                    if self.long_len < self.long_buf.len() {
+                        self.long_buf[self.long_len] = PPP_FLAG;
+                        self.long_len += 1;
+                        if is_valid_ppp_frame(&self.long_buf[..self.long_len]) {
+                            write_pipe_all(pipe, &self.long_buf[..self.long_len], DLCI_PPP).await;
+                        } else {
+                            warn!("PPP bad FCS, dropped {}B frame", self.long_len);
+                        }
+                    } else {
+                        warn!("PPP frame exceeded buffer, dropped");
+                    }
+                    // Keep 0x7E as potential opening flag of the next frame (shared-flag safe).
+                    self.long_buf[0] = PPP_FLAG;
+                    self.long_len = 1;
+
+                    if self.deferred_len > 0 {
+                        write_pipe_all(pipe, &self.deferred_buf[..self.deferred_len], DLCI_PPP)
+                            .await;
+                        self.deferred_len = 0;
+                    }
+                }
+            } else if self.long_len > 0 {
+                if self.long_len < self.long_buf.len() {
+                    self.long_buf[self.long_len] = b;
+                    self.long_len += 1;
+                } else {
+                    warn!("PPP frame overflow (>2048B), resetting");
+                    self.long_len = 0;
+                }
+            }
+        }
+    }
+}
+
+fn ppp_crc16_step(mut seed: u16, b: u8) -> u16 {
+    let e = (seed as u8) ^ b;
+    let f = (e ^ (e << 4)) as u16;
+    seed = (seed >> 8) ^ (f << 8) ^ (f << 3) ^ (f >> 4);
+    seed
+}
+
+fn is_valid_ppp_frame(raw: &[u8]) -> bool {
+    if raw.len() < 6 || raw[0] != PPP_FLAG || raw[raw.len() - 1] != PPP_FLAG || raw[1] != 0xFF {
+        return false;
+    }
+    let mut crc: u16 = 0x00FF; // crc16(0xFFFF, &[0xFF])
+    let mut escape = false;
+    let mut count = 0usize;
+    let mut first_ctrl = 0u8;
+
+    for &b in &raw[2..raw.len() - 1] {
+        if b == PPP_FLAG {
+            return false;
+        }
+        if b == PPP_ESC {
+            if escape {
+                return false;
+            }
+            escape = true;
+            continue;
+        }
+        let val = if escape {
+            escape = false;
+            b ^ 0x20
+        } else {
+            b
+        };
+        if count == 0 {
+            first_ctrl = val;
+        }
+        crc = ppp_crc16_step(crc, val);
+        count += 1;
+    }
+
+    !escape && count >= 3 && first_ctrl == 0x03 && crc == 0xF0B8
 }

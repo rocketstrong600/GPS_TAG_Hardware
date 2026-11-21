@@ -7,6 +7,7 @@ mod buzzer;
 #[allow(dead_code)]
 mod i2c_scanner;
 mod modem;
+mod nrf_boot;
 
 use defmt::*;
 use embassy_executor::Spawner;
@@ -19,14 +20,18 @@ use {defmt_rtt as _, panic_probe as _};
 async fn main(spawner: Spawner) -> ! {
     let mut b = board::init();
 
+    nrf_boot::ensure_firmware(&mut b.ble, b.flash, nrf_boot::EMBEDDED_FIRMWARE)
+        .await
+        .unwrap();
+
     bmi160::run_bringup_test(b.imu.i2c1, b.imu.scl, b.imu.sda).await;
 
+    #[cfg(debug_assertions)]
     spawner.spawn(idle_task().unwrap());
 
-    let (mut client, mut ppp_ch) =
-        modem::init(&spawner, &mut b.modem_pins, b.modem_tx, b.modem_rx)
-            .await
-            .unwrap();
+    let (mut client, mut ppp_ch) = modem::init(&spawner, &mut b.modem_pins, b.modem_tx, b.modem_rx)
+        .await
+        .unwrap();
 
     b.buzzer.play(&buzzer::songs::NOKIA).await;
     spawner.spawn(blink_task(b.led).unwrap());
@@ -39,32 +44,48 @@ async fn main(spawner: Spawner) -> ! {
         .await
         .is_ok()
     {
-        modem::gps::configure_xtra(&mut client).await;
+        modem::gps::ensure_xtra(&mut client, "yesinternet").await;
         if let Err(e) = modem::gps::enable(&mut client).await {
             error!("Failed to enable GNSS: {:?}", e);
         }
         if modem::dial_ppp(&mut ppp_ch).await.is_ok() {
-            let stack = modem::ppp::start(&spawner, ppp_ch, 0x1234_5678_9abc_def0);
+            let seed = embassy_time::Instant::now().as_ticks() ^ 0x1234_5678_9abc_def0;
+            let stack = modem::ppp::start(&spawner, ppp_ch, seed);
             modem::ppp::test_connectivity(stack).await;
+            modem::log_status(&mut client).await;
         }
     } else if let Err(e) = modem::gps::enable(&mut client).await {
         error!("Failed to enable GNSS: {:?}", e);
     }
 
+    let gnss_start = embassy_time::Instant::now();
+    let mut got_first_fix = false;
+
     loop {
-        match modem::gps::get_location(&mut client).await {
-            Ok(response) => {
+        match modem::gps::get_fix(&mut client).await {
+            Ok(fix) => {
+                if !got_first_fix {
+                    got_first_fix = true;
+                    info!("TTFF: {}s", gnss_start.elapsed().as_secs());
+                }
                 info!(
-                    "Lat:{},Long:{}",
-                    str::from_utf8(&response.latitude).unwrap_or("0.0"),
-                    str::from_utf8(&response.longitude).unwrap_or("0.0")
+                    "Fix({:?}): lat={}, lon={}, alt={}m, hdop={}, sats={}",
+                    fix.fix_type,
+                    fix.latitude,
+                    fix.longitude,
+                    fix.altitude_m,
+                    fix.hdop,
+                    fix.satellites,
                 );
             }
+            Err(modem::gps::GpsError::NotFixed) => {
+                info!("GPS acquiring fix ({}s)...", gnss_start.elapsed().as_secs());
+            }
             Err(e) => {
-                error!("{}", e);
+                warn!("GPS error ({}s): {:?}", gnss_start.elapsed().as_secs(), e);
             }
         }
-        Timer::after_secs(30).await;
+        Timer::after_secs(2).await;
     }
 }
 
@@ -78,6 +99,7 @@ async fn blink_task(mut led: Output<'static>) {
     }
 }
 
+#[cfg(debug_assertions)]
 #[embassy_executor::task]
 async fn idle_task() {
     loop {

@@ -260,8 +260,7 @@ impl<'d> Bmi160<'d> {
     }
 
     pub fn read_regs(&mut self, start_reg: u8, buf: &mut [u8]) -> Result<(), Error> {
-        self.i2c
-            .blocking_write_read(self.addr, &[start_reg], buf)?;
+        self.i2c.blocking_write_read(self.addr, &[start_reg], buf)?;
         Ok(())
     }
 
@@ -351,11 +350,7 @@ impl<'d> Bmi160<'d> {
         Ok(())
     }
 
-    pub async fn set_gyro_enabled(
-        &mut self,
-        enable: bool,
-        range: GyroRange,
-    ) -> Result<(), Error> {
+    pub async fn set_gyro_enabled(&mut self, enable: bool, range: GyroRange) -> Result<(), Error> {
         if enable {
             self.write_reg(reg::CMD, cmd::GYR_PMU_NORMAL)?;
             Timer::after_millis(85).await;
@@ -392,9 +387,11 @@ impl<'d> Bmi160<'d> {
     }
 
     pub fn enable_high_g(&mut self, cfg: HighGConfig) -> Result<(), Error> {
-        let th = ((cfg.threshold_mg as u32 * 1000) / self.accel_range.high_g_ug_per_lsb())
+        let th = ((cfg.threshold_mg as u32 * 1000) / self.accel_range.high_g_ug_per_lsb()).min(255)
+            as u8;
+        let dur = ((cfg.duration_ms as u32 * 10) / 25)
+            .saturating_sub(1)
             .min(255) as u8;
-        let dur = ((cfg.duration_ms as u32 * 10) / 25).saturating_sub(1).min(255) as u8;
 
         self.write_reg(reg::INT_LOWHIGH_3, dur)?;
         self.write_reg(reg::INT_LOWHIGH_4, th)?;
@@ -409,7 +406,9 @@ impl<'d> Bmi160<'d> {
 
     pub fn enable_low_g(&mut self, cfg: LowGConfig) -> Result<(), Error> {
         let th = ((cfg.threshold_mg as u32 * 1000) / 7_810).min(255) as u8;
-        let dur = ((cfg.duration_ms as u32 * 10) / 25).saturating_sub(1).min(255) as u8;
+        let dur = ((cfg.duration_ms as u32 * 10) / 25)
+            .saturating_sub(1)
+            .min(255) as u8;
 
         self.write_reg(reg::INT_LOWHIGH_0, dur)?;
         self.write_reg(reg::INT_LOWHIGH_1, th)?;
@@ -427,7 +426,9 @@ impl<'d> Bmi160<'d> {
             .min(255) as u8;
         // 0..15 -> (n + 1) * 1.28 s (up to 20.48 s); higher values step by 5.12 s / 10.24 s
         let dur_code = if cfg.duration_s <= 20 {
-            ((cfg.duration_s as u32 * 100) / 128).saturating_sub(1).min(15) as u8
+            ((cfg.duration_s as u32 * 100) / 128)
+                .saturating_sub(1)
+                .min(15) as u8
         } else {
             (16 + ((cfg.duration_s - 20) / 5)).min(31) as u8
         };
@@ -724,7 +725,11 @@ pub async fn run_bringup_test(
     }
 
     match imu.read_temperature_mc() {
-        Ok(Some(mc)) => info!("BMI160 die temp: {}.{:02} C", mc / 1000, (mc.abs() % 1000) / 10),
+        Ok(Some(mc)) => info!(
+            "BMI160 die temp: {}.{:02} C",
+            mc / 1000,
+            (mc.abs() % 1000) / 10
+        ),
         Ok(None) => warn!("BMI160 die temp: invalid"),
         Err(e) => error!("BMI160 temp read failed: {:?}", e),
     }

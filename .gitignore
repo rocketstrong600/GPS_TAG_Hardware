@@ -1,3 +1,6 @@
 /target
+/ble-boot/target
+/ble-test/target
+*.bin
 .direnv/
 

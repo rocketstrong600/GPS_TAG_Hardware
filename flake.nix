@@ -18,7 +18,7 @@
         pkgs = import nixpkgs { inherit system overlays; };
 
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          targets = [ "thumbv7m-none-eabi" ];
+          targets = [ "thumbv7m-none-eabi" "thumbv7em-none-eabihf" ];
           extensions = [ "rust-analyzer" "clippy" "rustfmt" ];
         };
 
@@ -47,7 +47,10 @@
           buildInputs = [
             rustToolchain
             probe-rs-tools
+            llvmPackages.libclang.lib
+            llvmPackages.llvm
           ];
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
         };
       }
