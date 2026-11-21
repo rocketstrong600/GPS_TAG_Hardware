@@ -105,8 +105,8 @@
 ---
 
 ## 7. Free Pins for ST25DV16K (Soft_I2C)
-| STM32 Pin | Peripheral / Signal | Notes |
-| --- | --- | --- |
+| STM32 Pin | Peripheral / Signal |
+| --- | --- |
 | `PC10` | `I2CS_SCL` |
 | `PC11` | `I2CS_SDA` |
 
