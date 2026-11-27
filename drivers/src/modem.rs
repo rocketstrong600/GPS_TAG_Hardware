@@ -1,8 +1,40 @@
+//! Quectel **EC21-AU** LTE Cat-1 + Multi-Constellation GNSS modem driver.
+//!
+//! ## Architecture
+//! [`init`] powers on the EC21-AU, waits for PMIC readiness (`AT+CBC`), upgrades `USART6`
+//! dynamically from `115200 bps` to **`460800 bps`** via volatile `AT+IPR=460800` (never saved
+//! to NVRAM so cold boots always start cleanly at `115200 bps`), and enters **3GPP TS 27.010
+//! CMUX** (`AT+CMUX=0`) splitting the single UART into two concurrent logical channels:
+//! - **`DLCI 1`** ([`ModemClient`]): AT commands, GNSS ([`gps`]), power control ([`power`]),
+//!   and SMS ([`sms`])
+//! - **`DLCI 2`** ([`cmux::PppChannel`]): Full IPv4 TCP/UDP/DNS via [`ppp`] (`embassy-net-ppp`)
+//!
+//! ## Submodules
+//! - [`cmux`] — 3GPP TS 27.010 Basic Option multiplexer with bidirectional `MSC` flow control
+//!   and EC21-AU PPP frame de-interleaving
+//! - [`gps`] — Multi-constellation GNSS, gpsOneXTRA3 injection, Qualcomm DPO, periodic `fixrate`,
+//!   and Hot-Start standby
+//! - [`https`] — TLS 1.3 HTTPS / HTTP client (`reqwless` + `embedded-tls`) over [`ppp`]
+//! - [`power`] — Fast-wake DTR slow-clock sleep (`AT+QSCLK=1`, ~85 ms wake with LTE + CMUX + PPP
+//!   kept alive), standby, and flight mode (`AT+CFUN`)
+//! - [`ppp`] — `embassy-net` IPv4 stack runner (with auto-redial), connectivity check, and
+//!   concurrent perf benchmark
+//! - [`sms`] — SMS text-mode send, read (`AT+CMGR`/`AT+CMGL`), `+CMTI` receive, and delete
+//! - [`status`] — Battery % / voltage (`AT+CBC`), signal dBm (`AT+CSQ`), LTE registration,
+//!   operator, UTC time, ADC, and SIM/IMEI telemetry
+//! - [`commands`] — `atat` command and URC definitions
+//!
+//! See `examples/modem_gps_low_power.rs`, `examples/modem_ppp_http.rs`, `examples/modem_https.rs`,
+//! and `examples/sms_to_nfc.rs`.
+
 pub mod cmux;
 pub mod commands;
 pub mod gps;
+pub mod https;
+pub mod power;
 pub mod ppp;
 pub mod sms;
+pub mod status;
 
 use atat::asynch::{AtatClient, Client};
 use atat::heapless::String;
@@ -16,7 +48,7 @@ use embassy_time::{Duration, Timer, WithTimeout};
 use embedded_io_async::{Read, Write};
 use static_cell::StaticCell;
 
-use cmux::{CmuxChannel, CmuxError, CmuxRx, CmuxTx};
+use cmux::{AtRx, CmuxError, CmuxTx, PppChannel};
 use commands::{
     AdcReading, BatteryCharge, GetBatteryCharge, GetIccid, GetImei, GetSignalQuality, GetSimStatus,
     ReadAdc, SetCmeErrorMode, SetSleepMode, SignalQuality, Urc,
@@ -26,6 +58,12 @@ pub const INGRESS_BUF_SIZE: usize = 1024;
 pub const URC_CAPACITY: usize = 128;
 pub const URC_SUBSCRIBERS: usize = 3;
 const AT_CLIENT_BUF_SIZE: usize = 1024;
+
+/// Initial boot baud rate of the EC21-AU (never overwritten in NVRAM).
+const BOOT_BAUDRATE: u32 = 115_200;
+/// Runtime baud rate negotiated dynamically via volatile `AT+IPR` before entering CMUX.
+/// At 16 MHz PCLK2, 460,800 bps gives 0.79% clock error (4x higher wire throughput than 115,200).
+const RUNTIME_BAUDRATE: u32 = 460_800;
 
 pub type ModemClient = Client<'static, CmuxTx, AT_CLIENT_BUF_SIZE>;
 
@@ -110,7 +148,7 @@ pub async fn init(
     pins: &mut ModemPins,
     mut tx: UartTx<'static, Async>,
     mut rx: RingBufferedUartRx<'static>,
-) -> Result<(ModemClient, CmuxChannel), ModemError> {
+) -> Result<(ModemClient, PppChannel), ModemError> {
     pins.power_on().await;
 
     wait_for_rdy(&mut tx, &mut rx).await?;
@@ -119,21 +157,14 @@ pub async fn init(
     send_at_ok(&mut tx, &mut rx, b"ATE0\r\n").await?;
     send_at_ok(&mut tx, &mut rx, b"AT+CMEE=1\r\n").await?;
 
-    // On cold boot, this EC21-AU firmware emits an early RDY where PMIC/ADC commands
-    // (AT+CBC / AT+QADC) return ERROR and then performs an internal warm restart ~10-12s
-    // later. Wait for that second RDY before entering CMUX so CMUX never loses sync.
-    if !probe_pmic_ready(&mut tx, &mut rx).await {
-        info!("EC21-AU stage-1 RDY (PMIC not ready); waiting for final RDY...");
-        if wait_for_token(&mut rx, b"RDY\r\n", Duration::from_secs(18)).await {
-            info!("EC21-AU final RDY!");
-            send_at_ok(&mut tx, &mut rx, b"ATE0\r\n").await?;
-            send_at_ok(&mut tx, &mut rx, b"AT+CMEE=1\r\n").await?;
-        } else {
-            warn!("EC21-AU second RDY not seen within 18s; continuing");
-        }
-    }
+    // On cold boot, this EC21-AU firmware can emit an early RDY before PMIC/ADC commands
+    // (AT+CBC) succeed, and may either settle in ~1-2s or perform a brief internal warm
+    // restart emitting a second RDY. Poll AT+CBC while also watching for a second RDY so we
+    // enter CMUX as soon as the modem is truly ready without stalling for 18s on normal boots.
+    wait_pmic_ready(&mut tx, &mut rx, Duration::from_secs(18)).await?;
 
     let _ = send_at_ok(&mut tx, &mut rx, b"AT+QSCLK=0\r\n").await;
+    upgrade_baudrate(&mut tx, &mut rx, RUNTIME_BAUDRATE).await;
     send_at_ok(&mut tx, &mut rx, b"AT+CMUX=0\r\n").await?;
     Timer::after_millis(50).await;
 
@@ -161,12 +192,39 @@ pub async fn init(
     );
 
     let _ = client.send(&SetCmeErrorMode { mode: 1 }).await;
+    configure_urc_routing(&mut client).await;
     if let Err(e) = set_lte_only(&mut client).await {
         warn!("Failed to set LTE-only mode: {:?}", e);
     }
     log_status(&mut client).await;
 
     Ok((client, ppp_ch))
+}
+
+/// Routes Quectel EC21-AU URCs (such as `+CMTI` SMS notifications and `+QHTTPGET`) to `uart1`
+/// and specifically CMUX `DLCI 1` so URCs are never lost to the disconnected USB port or injected
+/// into `DLCI 2` (PPP).
+async fn configure_urc_routing<C: AtatClient>(client: &mut C) {
+    let mut param = String::<12>::new();
+    let _ = param.push_str("urcport");
+    let mut port = String::<12>::new();
+    let _ = port.push_str("uart1");
+    if let Err(e) = client.send(&commands::SetUrcPort { param, port }).await {
+        warn!("Failed to set QURCCFG urcport=uart1: {:?}", e);
+    }
+
+    let mut cmux_param = String::<16>::new();
+    let _ = cmux_param.push_str("cmux/urcport");
+    match client
+        .send(&commands::SetCmuxUrcPort {
+            param: cmux_param,
+            dlci: cmux::DLCI_AT,
+        })
+        .await
+    {
+        Ok(_) => info!("EC21-AU URCs routed to uart1 / CMUX DLCI 1"),
+        Err(e) => warn!("Failed to set QCFG cmux/urcport=1: {:?}", e),
+    }
 }
 
 /// Locks the EC21-AU to LTE-only (`AT+QCFG="nwscanmode",3,1`) for Australian networks
@@ -252,7 +310,7 @@ pub async fn log_status<C: AtatClient>(client: &mut C) {
 
 /// Dials PPP (`ATD*99#`) directly on the PPP DLCI channel (`DLCI 2`), leaving
 /// `DLCI 1` free for concurrent AT/GPS commands.
-pub async fn dial_ppp(ppp_ch: &mut CmuxChannel) -> Result<(), ModemError> {
+pub async fn dial_ppp(ppp_ch: &mut PppChannel) -> Result<(), ModemError> {
     drain_rx(ppp_ch, Duration::from_millis(25)).await;
     ppp_ch.write_all(b"ATD*99#\r\n").await?;
     match wait_for_dial_result(ppp_ch, Duration::from_secs(10)).await {
@@ -269,6 +327,48 @@ pub async fn dial_ppp(ppp_ch: &mut CmuxChannel) -> Result<(), ModemError> {
             Err(ModemError::PppDialFailed)
         }
     }
+}
+
+/// Returns `DLCI 2` to AT command mode (re-opening the DLCI if closed, or sending the standard
+/// Hayes `+++` escape sequence + `ATH` if the modem is still stuck in data mode) and re-dials
+/// PPP (`ATD*99#`).
+pub async fn redial_ppp(ppp_ch: &mut PppChannel) -> Result<(), ModemError> {
+    if !cmux::is_dlci_open(cmux::DLCI_PPP) {
+        warn!("CMUX DLCI 2 closed; reopening before PPP redial");
+        cmux::open_dlci(cmux::DLCI_PPP)
+            .await
+            .map_err(|_| ModemError::PppDialFailed)?;
+    }
+
+    // Drain any trailing LCP Terminate / NO CARRIER bytes after PPP exits.
+    drain_rx(ppp_ch, Duration::from_millis(200)).await;
+
+    if !probe_at_ok(ppp_ch, Duration::from_secs(1)).await {
+        warn!("DLCI 2 not responding to AT; sending +++ escape + ATH");
+        // Standard Hayes escape: >=1 s silence, "+++", >=1 s silence.
+        Timer::after_millis(1100).await;
+        ppp_ch.write_all(b"+++").await?;
+        let _ = wait_for_token(ppp_ch, b"OK", Duration::from_millis(1500)).await;
+        drain_rx(ppp_ch, Duration::from_millis(100)).await;
+        ppp_ch.write_all(b"ATH\r\n").await?;
+        let _ = wait_for_token(ppp_ch, b"OK", Duration::from_secs(2)).await;
+        drain_rx(ppp_ch, Duration::from_millis(100)).await;
+
+        if !probe_at_ok(ppp_ch, Duration::from_secs(1)).await {
+            error!("DLCI 2 failed to return to AT command mode");
+            return Err(ModemError::PppDialFailed);
+        }
+    }
+
+    dial_ppp(ppp_ch).await
+}
+
+async fn probe_at_ok(ppp_ch: &mut PppChannel, timeout: Duration) -> bool {
+    drain_rx(ppp_ch, Duration::from_millis(25)).await;
+    if ppp_ch.write_all(b"AT\r\n").await.is_err() {
+        return false;
+    }
+    wait_for_token(ppp_ch, b"OK", timeout).await
 }
 
 enum DialResult {
@@ -313,7 +413,7 @@ async fn wait_for_dial_result<R: Read>(rx: &mut R, timeout: Duration) -> DialRes
 
 #[embassy_executor::task]
 async fn at_reader_task(
-    mut rx: CmuxRx,
+    mut rx: AtRx,
     mut ingress: Ingress<
         'static,
         DefaultDigester<Urc>,
@@ -358,11 +458,113 @@ async fn send_at_ok(
     Err(ModemError::CmuxSetupFailed)
 }
 
+/// Negotiates a higher volatile UART baud rate (`AT+IPR=<baud>`, never saved with `AT&W`)
+/// before entering CMUX, falling back to `BOOT_BAUDRATE` if the link does not verify.
+async fn upgrade_baudrate(
+    tx: &mut UartTx<'static, Async>,
+    rx: &mut RingBufferedUartRx<'static>,
+    target_baud: u32,
+) {
+    if target_baud == BOOT_BAUDRATE {
+        return;
+    }
+
+    let mut cmd = String::<24>::new();
+    let _ = core::fmt::write(&mut cmd, format_args!("AT+IPR={}\r\n", target_baud));
+    if send_at_ok(tx, rx, cmd.as_bytes()).await.is_err() {
+        warn!(
+            "EC21 rejected AT+IPR={}; staying at {} bps",
+            target_baud, BOOT_BAUDRATE
+        );
+        return;
+    }
+
+    Timer::after_millis(20).await;
+    drain_rx(rx, Duration::from_millis(10)).await;
+
+    if let Err(e) = tx.set_baudrate(target_baud) {
+        warn!("STM32 USART6 set_baudrate({}) failed: {:?}", target_baud, e);
+        return;
+    }
+    Timer::after_millis(20).await;
+    drain_rx(rx, Duration::from_millis(10)).await;
+
+    let mut verified = false;
+    for _ in 0..5 {
+        let _ = tx.write_all(b"AT\r\n").await;
+        if wait_for_token(rx, b"OK\r\n", Duration::from_millis(250)).await {
+            verified = true;
+            break;
+        }
+        Timer::after_millis(30).await;
+    }
+
+    if verified {
+        info!("EC21-AU UART upgraded to {} bps", target_baud);
+    } else {
+        warn!(
+            "EC21-AU did not respond at {} bps; reverting to {} bps",
+            target_baud, BOOT_BAUDRATE
+        );
+        let _ = tx.set_baudrate(BOOT_BAUDRATE);
+        Timer::after_millis(20).await;
+        drain_rx(rx, Duration::from_millis(20)).await;
+    }
+}
+
+enum PmicProbe {
+    Ready,
+    NotReady,
+    Rebooted,
+}
+
+/// Waits until `AT+CBC` succeeds (PMIC/AP subsystem ready), catching any stage-2 warm restart
+/// `RDY` along the way without stalling for the full timeout on normal boots.
+async fn wait_pmic_ready(
+    tx: &mut UartTx<'static, Async>,
+    rx: &mut RingBufferedUartRx<'static>,
+    timeout: Duration,
+) -> Result<(), ModemError> {
+    let deadline = embassy_time::Instant::now() + timeout;
+    let mut logged_wait = false;
+
+    while embassy_time::Instant::now() < deadline {
+        match probe_pmic_ready(tx, rx).await {
+            PmicProbe::Ready => {
+                if logged_wait {
+                    info!("EC21-AU PMIC ready!");
+                }
+                return Ok(());
+            }
+            PmicProbe::Rebooted => {
+                info!("EC21-AU final RDY!");
+                send_at_ok(tx, rx, b"ATE0\r\n").await?;
+                send_at_ok(tx, rx, b"AT+CMEE=1\r\n").await?;
+                logged_wait = true;
+            }
+            PmicProbe::NotReady => {
+                if !logged_wait {
+                    info!("EC21-AU PMIC settling after RDY; polling until ready...");
+                    logged_wait = true;
+                }
+                if wait_for_token(rx, b"RDY\r\n", Duration::from_millis(500)).await {
+                    info!("EC21-AU final RDY!");
+                    send_at_ok(tx, rx, b"ATE0\r\n").await?;
+                    send_at_ok(tx, rx, b"AT+CMEE=1\r\n").await?;
+                }
+            }
+        }
+    }
+
+    warn!("EC21-AU PMIC readiness timed out; continuing");
+    Ok(())
+}
+
 /// Checks whether the EC21 PMIC/AP subsystem is ready by issuing `AT+CBC`.
 async fn probe_pmic_ready(
     tx: &mut UartTx<'static, Async>,
     rx: &mut RingBufferedUartRx<'static>,
-) -> bool {
+) -> PmicProbe {
     let _ = tx.write_all(b"AT+CBC\r\n").await;
     let mut window = [0u8; 32];
     let mut len = 0usize;
@@ -380,11 +582,18 @@ async fn probe_pmic_ready(
                         window[window.len() - 1] = byte[0];
                     }
                     let slice = &window[..len];
+                    if contains_bytes(slice, b"RDY\r\n") {
+                        return PmicProbe::Rebooted;
+                    }
                     if contains_bytes(slice, b"OK\r\n") {
-                        return contains_bytes(slice, b"+CBC:");
+                        return if contains_bytes(slice, b"+CBC:") {
+                            PmicProbe::Ready
+                        } else {
+                            PmicProbe::NotReady
+                        };
                     }
                     if contains_bytes(slice, b"ERROR\r\n") {
-                        return false;
+                        return PmicProbe::NotReady;
                     }
                 }
                 _ => Timer::after_millis(10).await,
@@ -394,7 +603,7 @@ async fn probe_pmic_ready(
 
     fut.with_timeout(Duration::from_millis(600))
         .await
-        .unwrap_or(false)
+        .unwrap_or(PmicProbe::NotReady)
 }
 
 async fn drain_rx<R: Read>(rx: &mut R, idle_timeout: Duration) {

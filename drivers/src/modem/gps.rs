@@ -1,3 +1,12 @@
+//! Quectel EC21-AU multi-constellation GNSS and gpsOneXTRA3 assistance driver.
+//!
+//! - Uses `gnssconfig=1` (GPS + GLONASS + BeiDou + Galileo) and Qualcomm **Dynamic Power
+//!   Optimization** (`dpoenable=1`) automatically in [`enable`] and [`enable_with_rate`].
+//! - [`ensure_xtra`] downloads `xtra3grc.bin` (7-day GPS+GLONASS+BeiDou ephemeris, verified for
+//!   Australia) with automatic `xtra2.bin` fallback, injecting NITZ UTC time (`AT+QLTS=1`).
+//! - [`disable`] terminates GNSS cleanly via `AT+QGPSEND` so ephemeris, XTRA, and RTC stay hot
+//!   in RAM for ~1–5 s Hot Starts.
+
 use atat::asynch::AtatClient;
 use atat::heapless::String;
 use atat::{AtatCmd, CmeError, Error as AtatError};
@@ -6,9 +15,10 @@ use embassy_time::{Duration, WithTimeout};
 
 use super::cmux;
 use super::commands::{
-    ActivatePdp, DeactivatePdp, DeleteFile, GetGpsLocation, GetNetworkTime, GpsLocation, HttpGet,
-    HttpReadFile, InjectGpsXtraData, InjectGpsXtraTime, NoResponse, QueryGpsXtraData, SetGpsCfg,
-    SetGpsPower, SetGpsXtra, SetHttpCtx, SetPdpContext, Urc,
+    ActivatePdp, DeactivatePdp, DeleteFile, EndGpsSession, GetGpsLocation, GetNetworkTime,
+    GpsLocation, HttpGet, HttpReadFile, InjectGpsXtraData, InjectGpsXtraTime, NoResponse,
+    QueryGpsState, QueryGpsXtraData, SetGpsCfg, SetGpsPower, SetGpsPowerEx, SetGpsXtra, SetHttpCtx,
+    SetPdpContext, Urc,
 };
 
 /// Qualcomm IZat XTRA3 (GPS+GLONASS+BeiDou, ideal for Australia) with XTRA2 fallback.
@@ -382,16 +392,40 @@ async fn wait_http_readfile(
         .unwrap_or(false)
 }
 
-/// Configures multi-constellation GNSS (`gnssconfig=1`: GPS+GLONASS+BeiDou+Galileo)
-/// and enables the EC21 GNSS engine. Idempotent if GNSS is already running (`CME 504`).
-pub async fn enable<C: AtatClient>(client: &mut C) -> Result<(), GpsError> {
+/// Enables or disables Qualcomm GNSS Dynamic Power Optimization (`AT+QGPSCFG="dpoenable",<0|1>`).
+///
+/// When enabled, the GNSS engine automatically duty-cycles its RF front-end between satellite
+/// measurements to reduce tracking current while maintaining a hot lock.
+#[allow(dead_code)]
+pub async fn set_dpo<C: AtatClient>(client: &mut C, enable: bool) -> Result<(), GpsError> {
     let mut param = String::<24>::new();
-    let _ = param.push_str("gnssconfig");
-    let _ = client.send(&SetGpsCfg { param, value: 1 }).await;
+    let _ = param.push_str("dpoenable");
+    client
+        .send(&SetGpsCfg {
+            param,
+            value: u8::from(enable),
+        })
+        .await?;
+    info!("EC21 GNSS DPO={}", enable);
+    Ok(())
+}
+
+/// Returns `true` if the EC21 GNSS engine is currently active (`AT+QGPS?`).
+#[allow(dead_code)]
+pub async fn is_enabled<C: AtatClient>(client: &mut C) -> Result<bool, GpsError> {
+    let state = client.send(&QueryGpsState).await?;
+    Ok(state.enabled != 0)
+}
+
+/// Configures multi-constellation GNSS (`gnssconfig=1`: GPS+GLONASS+BeiDou+Galileo),
+/// enables Dynamic Power Optimization (`dpoenable=1`), and starts continuous 1 Hz GNSS.
+/// Idempotent if GNSS is already running (`CME 504`).
+pub async fn enable<C: AtatClient>(client: &mut C) -> Result<(), GpsError> {
+    configure_gnss_defaults(client).await;
 
     match client.send(&SetGpsPower { mode: 1 }).await {
         Ok(_) => {
-            info!("EC21 GNSS enabled");
+            info!("EC21 GNSS enabled (1 Hz)");
             Ok(())
         }
         Err(AtatError::CmeError(CmeError::ManufacturerSpecific(CME_GNSS_SESSION_ONGOING))) => {
@@ -402,12 +436,72 @@ pub async fn enable<C: AtatClient>(client: &mut C) -> Result<(), GpsError> {
     }
 }
 
+/// Starts continuous GNSS with a configurable interval between fixes (`fix_rate_secs`,
+/// `1..=65535`) via `AT+QGPS=1,30,50,0,<fix_rate_secs>` and DPO enabled.
+///
+/// Larger intervals (e.g. 5–30 s) let the GNSS engine duty-cycle internally instead of solving
+/// every second while preserving a warm/hot fix. If GNSS is already running, restarts it at the
+/// requested rate.
+#[allow(dead_code)]
+pub async fn enable_with_rate<C: AtatClient>(
+    client: &mut C,
+    fix_rate_secs: u16,
+) -> Result<(), GpsError> {
+    let rate = fix_rate_secs.max(1);
+    configure_gnss_defaults(client).await;
+
+    let cmd = SetGpsPowerEx {
+        mode: 1,
+        fixmaxtime: 30,
+        fixmaxdist: 50,
+        fixcount: 0, // continuous
+        fixrate: rate,
+    };
+
+    match client.send(&cmd).await {
+        Ok(_) => {
+            info!("EC21 GNSS enabled (fixrate={}s)", rate);
+            Ok(())
+        }
+        Err(AtatError::CmeError(CmeError::ManufacturerSpecific(CME_GNSS_SESSION_ONGOING))) => {
+            disable(client).await?;
+            client.send(&cmd).await?;
+            info!("EC21 GNSS restarted (fixrate={}s)", rate);
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn configure_gnss_defaults<C: AtatClient>(client: &mut C) {
+    let mut param = String::<24>::new();
+    let _ = param.push_str("gnssconfig");
+    let _ = client.send(&SetGpsCfg { param, value: 1 }).await;
+
+    let mut dpo = String::<24>::new();
+    let _ = dpo.push_str("dpoenable");
+    if let Err(e) = client
+        .send(&SetGpsCfg {
+            param: dpo,
+            value: 1,
+        })
+        .await
+    {
+        warn!("AT+QGPSCFG=\"dpoenable\",1 failed: {:?}", e);
+    }
+}
+
+/// Cleanly stops the active GNSS session via `AT+QGPSEND`.
+///
+/// Stopping cleanly (instead of cutting modem VBAT) retains satellite ephemeris, XTRA data,
+/// and RTC time in RAM so the next [`enable`] / [`enable_with_rate`] performs a ~1–5 s Hot Start
+/// while letting the EC21 drop to ~1.5–2.5 mA slow-clock sleep in the meantime.
 #[allow(dead_code)]
 pub async fn disable<C: AtatClient>(client: &mut C) -> Result<(), GpsError> {
-    match client.send(&SetGpsPower { mode: 0 }).await {
+    match client.send(&EndGpsSession).await {
         Ok(_)
         | Err(AtatError::CmeError(CmeError::ManufacturerSpecific(CME_GNSS_SESSION_NOT_ACTIVE))) => {
-            info!("EC21 GNSS disabled");
+            info!("EC21 GNSS disabled (AT+QGPSEND)");
             Ok(())
         }
         Err(e) => Err(e.into()),

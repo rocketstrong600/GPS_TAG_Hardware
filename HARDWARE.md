@@ -23,8 +23,8 @@
 
 | STM32 Pin | Peripheral / Signal | Notes |
 | --- | --- | --- |
-| `PC6` | `USART6_TX` | DMA: `DMA2_CH6` |
-| `PC7` | `USART6_RX` | DMA: `DMA2_CH2` (ring-buffered) |
+| `PC6` | `USART6_TX` | DMA: `DMA2_CH6`; boots at `115200 bps`, dynamically upgraded to `460800 bps` via volatile `AT+IPR` before CMUX |
+| `PC7` | `USART6_RX` | DMA: `DMA2_CH2` (4 KiB ring buffer) |
 
 ### Control & Power GPIOs
 
@@ -36,7 +36,7 @@
 | `PB0` | `m_ap_ready` | Init `LOW`, driven `HIGH` | `AP_READY` |
 | `PB1` | `m_wake` | Init `LOW`, driven `HIGH` | Modem wake |
 | `PB15` | `m_uart_enable` | Init `HIGH` | UART level-shifter / buffer enable |
-| `PC8` | `m_uart_dtr` | Init `LOW` | UART `DTR` |
+| `PC8` | `m_uart_dtr` | Init `LOW` | UART `DTR` (verified non-inverted with `AT+QSCLK=1`: `HIGH` = allow sleep, `LOW` = wake in ~80 ms) |
 
 ### Power-On Sequence (`src/main.rs`)
 
@@ -104,11 +104,17 @@
 
 ---
 
-## 7. Free Pins for ST25DV16K (Soft_I2C)
-| STM32 Pin | Peripheral / Signal |
-| --- | --- |
-| `PC10` | `I2CS_SCL` |
-| `PC11` | `I2CS_SDA` |
+## 7. NFC Tag — STMicroelectronics `ST25DV16K` (Software I2C)
+
+- **Bus:** Bit-banged open-drain `SoftI2c` (~100 kHz, internal pull-ups enabled)
+- **I2C Addresses:** `0x53` (User EEPROM `0x0000..=0x07FF`, Dynamic regs `0x2000..=0x2007`, FTM Mailbox `0x2008..=0x2107`), `0x57` (System area `0x0000..=0x0020`, I2C password `0x0900`)
+- **Verified on hardware:** `IC_REF = 0x26`, `IC_REV = 0x13`, `UID = E0:02:26:03:96:7A:E3:19`, `MEM = 2048 B` (`4 B` blocks)
+- **GPO / Interrupt:** Open-drain `GPO` (`IC_REF = 0x26`) wired directly to `SCL` (`PC10` / `EXTI10`). Configured for `RF_WRITE` pulse mode (`GPO = 0xC0`, `IT_TIME = 0x00` → `301 µs` active-low pulse) so `SCL` stays High-Z at idle and wakes STM32 via `EXTI10` with zero polling.
+
+| STM32 Pin | Peripheral / Signal | Notes |
+| --- | --- | --- |
+| `PC10` | `I2CS_SCL` + `GPO` (`EXTI10`) | Open-drain shared bus + `RF_WRITE` interrupt wake |
+| `PC11` | `I2CS_SDA` | Verified (not swapped) |
 
 ---
 

@@ -1,3 +1,11 @@
+//! Asynchronous PWM buzzer driver (`TIM3_CH1` on `PB4`) with musical note definitions and
+//! built-in melodies ([`songs`]).
+//!
+//! Plays single tones via [`Buzzer::beep`] or full BPM-timed melodies via [`Buzzer::play`]
+//! (positive dividers = standard notes, negative dividers = dotted notes).
+//!
+//! See `examples/buzzer_melody.rs` for a runnable example.
+
 use embassy_stm32::time::hz;
 use embassy_stm32::timer::simple_pwm::SimplePwm;
 use embassy_stm32::timer::{Channel, GeneralInstance4Channel};

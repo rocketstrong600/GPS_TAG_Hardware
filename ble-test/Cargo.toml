@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "ble-test"
 version = "0.1.0"

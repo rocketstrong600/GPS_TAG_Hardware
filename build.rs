@@ -1,8 +1,13 @@
+#[cfg(feature = "nrf-fw")]
 use std::env;
+#[cfg(feature = "nrf-fw")]
 use std::fs;
+#[cfg(feature = "nrf-fw")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "nrf-fw")]
 use std::process::Command;
 
+#[cfg(feature = "nrf-fw")]
 const NRF_APP_BASE: usize = 0x0000_4000;
 
 fn main() {
@@ -11,9 +16,11 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
     println!("cargo:rustc-env=DEFMT_LOG=info");
 
+    #[cfg(feature = "nrf-fw")]
     build_nrf_firmware();
 }
 
+#[cfg(feature = "nrf-fw")]
 fn watch_dir(dir: &Path) {
     println!("cargo:rerun-if-changed={}", dir.display());
     if let Ok(entries) = fs::read_dir(dir) {
@@ -28,6 +35,7 @@ fn watch_dir(dir: &Path) {
     }
 }
 
+#[cfg(feature = "nrf-fw")]
 fn build_nrf_firmware() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let ble_dir = manifest_dir.join("ble-test");
@@ -79,6 +87,7 @@ fn build_nrf_firmware() {
 }
 
 /// Flatten an ARM little-endian ELF32's `PT_LOAD` segments into a raw binary image.
+#[cfg(feature = "nrf-fw")]
 fn elf32_to_bin(elf: &[u8], expected_base: usize) -> Vec<u8> {
     assert!(
         elf.len() >= 52 && &elf[0..4] == b"\x7fELF",

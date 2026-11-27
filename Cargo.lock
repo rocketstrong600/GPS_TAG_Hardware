@@ -1112,6 +1112,24 @@ dependencies = [
 name = "gps-tag"
 version = "0.1.0"
 dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.2.0",
+ "defmt-rtt",
+ "der 0.8.0",
+ "embassy-executor",
+ "embassy-stm32",
+ "embassy-time",
+ "embedded-hal 1.0.0",
+ "gps-tag-drivers",
+ "panic-probe",
+ "reqwless",
+]
+
+[[package]]
+name = "gps-tag-drivers"
+version = "0.1.0"
+dependencies = [
  "atat",
  "cortex-m",
  "cortex-m-rt",
@@ -1125,6 +1143,7 @@ dependencies = [
  "embassy-stm32",
  "embassy-sync",
  "embassy-time",
+ "embedded-hal 1.0.0",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "heapless 0.9.4",

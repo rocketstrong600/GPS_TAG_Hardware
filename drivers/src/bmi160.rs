@@ -1,3 +1,17 @@
+//! Bosch **BMI160** 6-axis IMU driver over blocking `I2C1` (`PB8`=SCL, `PB9`=SDA, address `0x68`).
+//!
+//! Supports:
+//! - Configurable accelerometer range (`±2g`..`±16g`) and ODR (`25..200 Hz`)
+//! - Optional gyroscope (`±125..±2000 °/s`) with independent suspend/enable for power savings
+//! - Hardware motion interrupts routed to `INT1` (`PB7`) or `INT2` (`PB6`):
+//!   - **Any-Motion** (`enable_any_motion`) — wake on movement
+//!   - **No-Motion** (`enable_no_motion`) — detect stationary state
+//!   - **High-G** (`enable_high_g`) — impact / shock / tap detection
+//!   - **Low-G** (`enable_low_g`) — freefall detection
+//! - Single-burst 12-byte gyro+accel reads (`read_sample`) and die temperature (`read_temperature_mc`)
+//!
+//! See `examples/imu_motion_wake.rs` for a complete interrupt-driven wakeup example.
+
 use defmt::{error, info, warn};
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::{Flex, Pull};

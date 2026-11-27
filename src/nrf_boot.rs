@@ -6,9 +6,10 @@ use embassy_stm32::peripherals;
 use embassy_stm32::usart::{self, Uart};
 use embassy_time::Timer;
 
-use crate::board::BlePins;
+use gps_tag_drivers::board::BlePins;
 
 /// nRF52832 application binary automatically built and flattened by `build.rs`.
+#[cfg(feature = "nrf-fw")]
 pub const EMBEDDED_FIRMWARE: &[u8] = include_bytes!(env!("NRF_FW_BIN"));
 
 const SYNC_0: u8 = 0xAA;
@@ -123,6 +124,7 @@ pub async fn ensure_firmware(
             "nrf_boot: firmware up-to-date ({:#018x}), skipping flash",
             want_hash
         );
+        ble.reset.set_low();
         return Ok(false);
     }
 

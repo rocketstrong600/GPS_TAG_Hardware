@@ -1,3 +1,7 @@
+//! Multi-bus hardware I2C diagnostic scanner (`I2C1`, `I2C2`, `I2C3`) used during board
+//! reverse-engineering and bring-up to detect external pull-ups, responding 7-bit addresses, and
+//! common IMU/sensor `WHO_AM_I` registers.
+
 use defmt::{info, warn};
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::{Input, Output, Pull};

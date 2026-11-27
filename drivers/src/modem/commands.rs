@@ -1,3 +1,5 @@
+//! `atat` AT command, response, and URC type definitions for the Quectel EC21-AU.
+
 #![allow(unused)]
 use atat::AtatCmd;
 use atat::atat_derive::{AtatCmd, AtatResp, AtatUrc};
@@ -57,6 +59,24 @@ pub struct EchoOff;
 pub struct SetCmeErrorMode {
     #[at_arg(position = 1)]
     pub mode: u8, // 1 = numeric +CME ERROR codes
+}
+
+#[derive(Clone, Debug, AtatResp)]
+pub struct FuncMode {
+    #[at_arg(position = 1)]
+    pub fun: u8,
+}
+
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CFUN?", FuncMode, timeout_ms = 1000)]
+pub struct GetFuncMode;
+
+/// Sets modem functionality (`0` = minimum / RF+SIM off, `1` = full, `4` = flight mode / RF off).
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CFUN", NoResponse, timeout_ms = 5000)]
+pub struct SetFuncMode {
+    #[at_arg(position = 1)]
+    pub fun: u8,
 }
 
 #[derive(Clone, Debug, AtatResp)]
@@ -208,6 +228,26 @@ pub struct SetNwScanMode {
     pub effect: u8,
 }
 
+/// Routes unsolicited result codes (URCs) to a physical port (`AT+QURCCFG="urcport","uart1"`).
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+QURCCFG", NoResponse, timeout_ms = 500)]
+pub struct SetUrcPort {
+    #[at_arg(position = 1)]
+    pub param: String<12>,
+    #[at_arg(position = 2)]
+    pub port: String<12>,
+}
+
+/// Routes CMUX URCs to a specific CMUX virtual channel (`AT+QCFG="cmux/urcport",<dlci>`).
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+QCFG", NoResponse, timeout_ms = 500)]
+pub struct SetCmuxUrcPort {
+    #[at_arg(position = 1)]
+    pub param: String<16>,
+    #[at_arg(position = 2)]
+    pub dlci: u8,
+}
+
 /// Configures PDP context 1 (`AT+CGDCONT=1,"IP","<apn>"`).
 #[derive(Clone, AtatCmd)]
 #[at_cmd("+CGDCONT", NoResponse, timeout_ms = 500)]
@@ -233,11 +273,43 @@ pub struct EpsRegStatus {
 #[at_cmd("+CEREG?", EpsRegStatus, timeout_ms = 500)]
 pub struct GetEpsRegStatus;
 
+#[derive(Clone, Debug, AtatResp)]
+pub struct GpsState {
+    #[at_arg(position = 1)]
+    pub enabled: u8,
+}
+
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+QGPS?", GpsState, timeout_ms = 500)]
+pub struct QueryGpsState;
+
 #[derive(Clone, AtatCmd)]
 #[at_cmd("+QGPS", NoResponse, timeout_ms = 300)]
 pub struct SetGpsPower {
     #[at_arg(position = 1)]
-    pub mode: u8, // 1 = ON, 0 = OFF
+    pub mode: u8, // 1 = Standalone ON
+}
+
+/// Cleanly ends an active GNSS session (`AT+QGPSEND`), saving ephemeris/position for Hot Start.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+QGPSEND", NoResponse, timeout_ms = 500)]
+pub struct EndGpsSession;
+
+/// Starts GNSS with explicit parameters: `AT+QGPS=<mode>,<fixmaxtime>,<fixmaxdist>,<fixcount>,<fixrate>`.
+/// `fixcount = 0` means continuous positioning; `fixrate` is seconds between fixes (`1..=65535`).
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+QGPS", NoResponse, timeout_ms = 500)]
+pub struct SetGpsPowerEx {
+    #[at_arg(position = 1)]
+    pub mode: u8,
+    #[at_arg(position = 2)]
+    pub fixmaxtime: u16,
+    #[at_arg(position = 3)]
+    pub fixmaxdist: u16,
+    #[at_arg(position = 4)]
+    pub fixcount: u16,
+    #[at_arg(position = 5)]
+    pub fixrate: u16,
 }
 
 #[derive(Clone, AtatCmd)]
@@ -438,4 +510,63 @@ pub struct SetSmsIndication {
 pub struct DeleteSms {
     #[at_arg(position = 1)]
     pub index: u16,
+}
+
+/// Deletes messages by flag (`AT+CMGD=<index>,<delflag>`, e.g. `1,4` deletes all stored SMS).
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CMGD", NoResponse, timeout_ms = 5000)]
+pub struct DeleteSmsWithFlag {
+    #[at_arg(position = 1)]
+    pub index: u16,
+    #[at_arg(position = 2)]
+    pub delflag: u8,
+}
+
+#[derive(Clone, Debug)]
+pub struct OperatorResp {
+    pub name: Option<String<32>>,
+}
+
+impl atat::AtatResp for OperatorResp {}
+
+/// Queries the currently selected cellular operator (`AT+COPS?`).
+#[derive(Clone)]
+pub struct GetOperator;
+
+impl AtatCmd for GetOperator {
+    type Response = OperatorResp;
+    const MAX_TIMEOUT_MS: u32 = 1000;
+    const EXPECTS_RESPONSE_CODE: bool = true;
+
+    fn write(&self, buf: &mut [u8]) -> usize {
+        let cmd = b"AT+COPS?\r";
+        buf[..cmd.len()].copy_from_slice(cmd);
+        cmd.len()
+    }
+
+    fn parse(
+        &self,
+        resp: Result<&[u8], atat::InternalError>,
+    ) -> Result<Self::Response, atat::Error> {
+        let raw = resp?;
+        let text = core::str::from_utf8(raw).map_err(|_| atat::Error::Parse)?;
+        // Format when registered: +COPS: <mode>,<format>,"<oper>"[,<AcT>]
+        // Format when unregistered: +COPS: <mode>
+        let name = text.find('"').and_then(|start| {
+            let rest = &text[start + 1..];
+            let end = rest.find('"')?;
+            let oper = &rest[..end];
+            if oper.is_empty() {
+                return None;
+            }
+            let mut s = String::<32>::new();
+            for ch in oper.chars() {
+                if s.push(ch).is_err() {
+                    break;
+                }
+            }
+            Some(s)
+        });
+        Ok(OperatorResp { name })
+    }
 }
